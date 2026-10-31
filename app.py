@@ -1,0 +1,537 @@
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+if ROOT.name == "pages":  # funziona sia come pagina in pages/ sia come app.py principale
+    ROOT = ROOT.parent
+sys.path.insert(0, str(ROOT))
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+import album_analysis as A
+import album_tables as T
+from report_pdf import build_pdf, find_logo
+
+st.set_page_config(page_title="Album Mastering Analyzer", layout="wide")
+
+st.markdown("""
+    <style>
+    :root { --bg: #0a0a09; --bg2: #111110; --amber: #e8a020; --text: #e8e4d8; --border: #2a2a26; }
+    .stApp { background-color: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; }
+    h1 { color: #e8a020 !important; font-family: 'Bebas Neue', sans-serif !important; }
+    h2, h3 { font-family: 'Bebas Neue', sans-serif !important; color: var(--text); }
+    div[data-testid="stFileUploader"] label { color: var(--text) !important; font-family: 'DM Sans', sans-serif !important; }
+    [data-testid="stMetric"] { background-color: var(--bg2) !important; border: 1px solid var(--border) !important; padding: 8px 12px; border-radius: 8px; }
+    [data-testid="stMetricLabel"] { color: var(--text) !important; font-family: 'DM Sans', sans-serif; font-size: 0.85rem; }
+    [data-testid="stMetricValue"] { color: var(--amber) !important; font-family: 'DM Mono', monospace; }
+    [data-testid="stFileUploader"] button p { color: var(--amber) !important; }
+    button[data-baseweb="tab"] p { font-size: 1.0rem; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def centered_title(text):
+    try:
+        st.title(text, width="stretch", text_alignment="center")
+    except TypeError:  # versioni piu' vecchie di Streamlit
+        st.markdown(f"<h1 style='text-align:center'>{text}</h1>", unsafe_allow_html=True)
+
+
+centered_title("VENTENA STUDIOS TOOLKIT")
+centered_title("🎼 Album Mastering Analyzer 🎼")
+st.write("Controllo finale del mastering di un album: loudness, true peak, dinamica, stereo, spettro e sottobande, "
+         "con confronto tra i brani, verso la media dell'album e (opzionalmente) verso una reference.")
+
+S = st.session_state
+MAX_TRACKS, MAX_REFS = 20, 3
+AUDIO_TYPES = ["wav", "mp3", "flac", "aif", "aiff", "ogg", "m4a", "aac"]
+MIME = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac", "ogg": "audio/ogg", "m4a": "audio/mp4",
+        "aac": "audio/aac", "aif": "audio/aiff", "aiff": "audio/aiff"}
+PAL = px.colors.qualitative.Light24
+AMBER = "#e8a020"
+
+S.setdefault("xo", list(A.DEFAULT_CROSSOVERS))
+S.setdefault("cache_g", {})
+S.setdefault("cache_b", {})
+S.setdefault("digests", {})
+S.setdefault("run", False)
+S.setdefault("sig", None)
+S.setdefault("last_tracks", None)
+S.setdefault("pdf", None)
+
+status_slot = st.container()
+tab_up, tab_set, tab_res, tab_det, tab_exp = st.tabs(
+    ["📥 Caricamento", "🎚️ Bande & Target", "📊 Risultati album", "🔍 Dettaglio & Ascolto", "📄 Export"])
+
+
+# =============================================================================== utilita'
+def digest_of(f):
+    key = getattr(f, "file_id", None) or (f.name, f.size)
+    if key not in S.digests:
+        S.digests[key] = A.file_digest(f.getvalue())
+    return S.digests[key]
+
+
+def style_fig(fig, height=430, ytitle=None, xtitle=None):
+    fig.update_layout(
+        paper_bgcolor="#111110", plot_bgcolor="#0a0a09", font=dict(color="#e8e4d8", family="DM Sans"),
+        height=height, margin=dict(t=30, b=40, l=10, r=10), hovermode="closest",
+        legend=dict(bgcolor="#111110", bordercolor="#2a2a26", borderwidth=1, itemclick="toggle",
+                    itemdoubleclick="toggleothers", font=dict(size=11)))
+    fig.update_xaxes(gridcolor="#2a2a26", zerolinecolor="#2a2a26", title=xtitle)
+    fig.update_yaxes(gridcolor="#2a2a26", zerolinecolor="#2a2a26", title=ytitle)
+    return fig
+
+
+def mmss(sec):
+    return f"{int(sec // 60)}:{int(sec % 60):02d}"
+
+
+def line_kw(t, width=1.6):
+    """Stile di linea: brani colorati, reference bianche tratteggiate."""
+    if t["ref"]:
+        return dict(color="#ffffff", width=2.2, dash="dot")
+    return dict(color=t["color"], width=width)
+
+
+def add_mean_line(fig, x, y, name="Media album"):
+    fig.add_trace(go.Scatter(x=x, y=y, name=name, mode="lines", line=dict(color=AMBER, width=4, dash="dash")))
+
+
+# =============================================================================== TAB: BANDE & TARGET
+with tab_set:
+    st.subheader("Frequenze di divisione delle sottobande")
+    st.caption("Crossover Linkwitz-Riley 4° ordine (somma delle bande piatta in ampiezza). "
+               "Le modifiche si applicano con il pulsante: se l'analisi e' gia' stata eseguita, "
+               "vengono ricalcolate solo le sottobande (le metriche globali restano in memoria).")
+    with st.form("xo_form"):
+        c1, c2, c3 = st.columns(3)
+        x1 = c1.number_input("Crossover 1 [Hz]", 30.0, 2000.0, float(S.xo[0]), 10.0)
+        x2 = c2.number_input("Crossover 2 [Hz]", 100.0, 10000.0, float(S.xo[1]), 50.0)
+        x3 = c3.number_input("Crossover 3 [Hz]", 500.0, 18000.0, float(S.xo[2]), 100.0)
+        b1, b2, _ = st.columns([1, 1, 3])
+        apply_xo = b1.form_submit_button("Applica crossover", type="primary")
+        reset_xo = b2.form_submit_button("Ripristina default")
+    if reset_xo:
+        S.xo = list(A.DEFAULT_CROSSOVERS)
+        st.rerun()
+    if apply_xo:
+        try:
+            S.xo = A.validate_crossovers([x1, x2, x3], fs=44100)
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+    st.info("Bande attive: " + "  |  ".join(A.band_labels(S.xo)))
+
+    st.subheader("Visualizzazione")
+    v1, v2 = st.columns(2)
+    weighting_label = v1.radio(
+        "Ponderazione dei livelli di banda", ["RMS lineare", "K-weighting (LUFS)"], horizontal=True,
+        help="RMS lineare = energia pura. K-weighting = curva BS.1770 (shelf alle alte, taglio sotto ~40 Hz), piu' vicina alla percezione. "
+             "Entrambe sono calcolate durante l'analisi: puoi cambiare in qualsiasi momento senza rielaborare.")
+    weighting = "k" if weighting_label.startswith("K") else "rms"
+    norm_label = v2.selectbox(
+        "Normalizzazione dello spettro 1/3 ottava", ["Livello totale", "Media 200 Hz - 5 kHz", "Assoluto (nessuna)"],
+        help="Normalizzare permette di confrontare la FORMA dello spettro tra brani con loudness diversa. "
+             "La media 200 Hz-5 kHz e' piu' sensibile alle differenze su bassi e acuti.")
+    spec_norm = {"Livello totale": "total", "Media 200 Hz - 5 kHz": "mid", "Assoluto (nessuna)": "abs"}[norm_label]
+
+    st.subheader("Target di mastering")
+    t1, t2, t3 = st.columns(3)
+    target_lufs = t1.number_input("Target loudness integrata [LUFS]", -30.0, 0.0, -10.0, 0.5)
+    tol_lu = t2.number_input("Tolleranza [± LU]", 0.0, 5.0, 1.0, 0.1)
+    target_tp = t3.number_input("True peak massimo [dBTP]", -6.0, 3.0, -1.0, 0.1)
+    with st.expander("Soglie di segnalazione outlier (scostamento dalla media dell'album)"):
+        d = T.DEFAULT_THRESH
+        o1, o2, o3, o4 = st.columns(4)
+        thresholds = {
+            "lufs_i": o1.number_input("LUFS [LU]", 0.1, 10.0, d["lufs_i"], 0.1),
+            "lra": o2.number_input("LRA [LU]", 0.1, 10.0, d["lra"], 0.1),
+            "crest_db": o3.number_input("Crest [dB]", 0.1, 10.0, d["crest_db"], 0.1),
+            "plr": o4.number_input("PLR [dB]", 0.1, 10.0, d["plr"], 0.1),
+            "corr": o1.number_input("Correlazione", 0.01, 1.0, d["corr"], 0.01),
+            "width_pct": o2.number_input("Width [%]", 1.0, 50.0, d["width_pct"], 1.0),
+            "tilt": o3.number_input("Tilt [dB/ott]", 0.05, 3.0, d["tilt"], 0.05),
+            "band_rel": o4.number_input("Livello banda [dB]", 0.5, 10.0, d["band_rel"], 0.5),
+        }
+
+# =============================================================================== TAB: CARICAMENTO
+with tab_up:
+    up1, up2 = st.columns([3, 2])
+    album_files = up1.file_uploader(f"Brani dell'album (max {MAX_TRACKS}) - WAV, MP3, FLAC, AIFF, OGG, M4A",
+                                    type=AUDIO_TYPES, accept_multiple_files=True, key="up_album")
+    ref_files = up2.file_uploader(f"Reference (opzionale, max {MAX_REFS})", type=AUDIO_TYPES,
+                                  accept_multiple_files=True, key="up_ref",
+                                  help="Brani commerciali o di riferimento: vengono analizzati allo stesso modo e mostrati "
+                                       "come linee bianche tratteggiate. Non sono inclusi nella media dell'album.")
+    if len(album_files) > MAX_TRACKS:
+        st.error(f"Hai caricato {len(album_files)} brani: verranno analizzati solo i primi {MAX_TRACKS}.")
+        album_files = album_files[:MAX_TRACKS]
+    if len(ref_files) > MAX_REFS:
+        ref_files = ref_files[:MAX_REFS]
+    album_title = st.text_input("Titolo album / progetto (usato nel report PDF)", value="", key="album_title")
+    if album_files or ref_files:
+        st.dataframe(pd.DataFrame(
+            [{"Ruolo": "Album", "File": f.name, "Dimensione [MB]": round(f.size / 1e6, 1)} for f in album_files] +
+            [{"Ruolo": "Reference", "File": f.name, "Dimensione [MB]": round(f.size / 1e6, 1)} for f in ref_files]),
+            hide_index=True, width="stretch")
+    go_btn = st.button("▶️ Analizza", type="primary", disabled=not album_files)
+    st.caption("Per ogni brano: loudness BS.1770 (integrata, short-term, momentary, LRA), true peak 4x, crest factor, PLR/PSR, "
+               "stereo (correlazione, M/S, compatibilita' mono), spettro a terzi d'ottava, tilt, centroide e analisi per sottobande. "
+               "Nessun file viene salvato su disco: tutto resta in memoria nella tua sessione.")
+
+# =============================================================================== ANALISI
+items = [(f, False) for f in album_files] + [(f, True) for f in ref_files]
+sig = tuple((digest_of(f), ref) for f, ref in items)
+if go_btn:
+    S.run, S.sig = True, sig
+
+
+def compute_tracks(items, xo):
+    out, errors = [], []
+    n = len(items)
+    with status_slot:
+        box = st.status("Analisi in corso...", expanded=True)
+        bar = box.progress(0.0)
+    for k, (f, ref) in enumerate(items):
+        dg = digest_of(f)
+        gk, bk = dg, (dg, tuple(xo))
+        need_g, need_b = gk not in S.cache_g, bk not in S.cache_b
+        if need_g or need_b:
+            box.write(f"{'Reference' if ref else 'Brano'} {k + 1}/{n}: {f.name}"
+                      + ("" if need_g else " (ricalcolo sottobande)"))
+            try:
+                res = A.analyze_bytes(f.getvalue(), f.name, xo, want_global=need_g, want_bands=need_b)
+            except Exception as e:  # file corrotto / formato non decodificabile
+                errors.append(f"{f.name}: {e}")
+                bar.progress((k + 1) / n)
+                continue
+            if need_g:
+                S.cache_g[gk] = {**res["global"], "fs": res["fs"], "duration": res["duration"], "info": res["info"]}
+            if need_b:
+                S.cache_b[bk] = res["bands"]
+        out.append({"name": Path(f.name).stem, "file": f.name, "ref": ref, "digest": dg,
+                    "g": S.cache_g[gk], "b": S.cache_b[bk]})
+        bar.progress((k + 1) / n)
+    box.update(label="Analisi completata", state="complete", expanded=False)
+    for e in errors:
+        st.error(e)
+    return out
+
+
+tracks = None
+if S.run and items:
+    if sig == S.sig:
+        tracks = compute_tracks(items, S.xo)
+    else:
+        with tab_up:
+            st.warning("I file caricati sono cambiati dall'ultima analisi: premi **Analizza** per aggiornare i risultati.")
+        tracks = S.last_tracks
+elif S.run:
+    tracks = S.last_tracks
+
+if tracks and not any(not t["ref"] for t in tracks):
+    tracks = None
+if tracks:
+    ai = 0
+    for i, t in enumerate(tracks):
+        if t["ref"]:
+            t["label"], t["color"] = f"REF · {t['name']}", "#ffffff"
+        else:
+            ai += 1
+            t["label"], t["color"] = f"{ai:02d} · {t['name']}", PAL[(ai - 1) % len(PAL)]
+    S.last_tracks = tracks
+    S.pdf = None if S.get("pdf_sig") != (sig, tuple(S.xo)) else S.pdf
+
+files_by_digest = {digest_of(f): f for f, _ in items}
+
+# =============================================================================== TAB: RISULTATI
+with tab_res:
+    if not tracks:
+        st.info("Carica i brani nella scheda **Caricamento** e premi **Analizza**.")
+    else:
+        album = T.albums(tracks)
+        labels = [t["label"] for t in tracks]
+        if S.get("vis_labels") != labels:
+            S.vis, S.vis_labels = list(labels), labels
+        for t in tracks:
+            if t["g"]["info"]["was_mono"]:
+                st.warning(f"{t['name']}: file mono, duplicato su due canali (correlazione e stereo non significativi).")
+
+        dev, flag = T.deviation_df(tracks, weighting, thresholds)
+        dev.index = flag.index = labels
+        status = {t["label"]: T.target_status(t["g"], target_lufs, tol_lu, target_tp) for t in tracks}
+        n_off = sum(1 for t in album if not status[t["label"]][0])
+        n_out = int(flag.loc[[t["label"] for t in album]].any(axis=1).sum())
+        lufs_all = [t["g"]["lufs_i"] for t in album]
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Brani analizzati", len(album))
+        k2.metric("LUFS medio album", f"{np.nanmean(lufs_all):.1f}", f"spread {np.nanmax(lufs_all) - np.nanmin(lufs_all):.1f} LU", delta_color="off")
+        k3.metric("True peak max", f"{max(t['g']['tp_db'] for t in album):.2f} dBTP")
+        k4.metric("Fuori target", f"{n_off} / {len(album)}")
+        k5.metric("Brani con outlier", f"{n_out} / {len(album)}")
+
+        # --- visibilita' brani
+        st.markdown("#### Brani visibili nei grafici")
+        s1, s2, s3 = st.columns([1, 1, 8])
+        s1.button("Tutti", on_click=lambda: S.update(vis=list(labels)))
+        s2.button("Nessuno", on_click=lambda: S.update(vis=[]))
+        sel = s3.multiselect("Seleziona i brani (oppure clicca sulle voci della legenda del grafico: "
+                             "click = accendi/spegni, doppio click = isola)", labels, key="vis", label_visibility="collapsed")
+        vis = [t for t in tracks if t["label"] in sel]
+        st.caption("La linea ambra tratteggiata e' la media dell'intero album (sempre calcolata su tutti i brani, non solo su quelli visibili). "
+                   "Le reference sono bianche tratteggiate.")
+
+        # --- tabella riepilogo
+        st.markdown("### 📋 Riepilogo")
+        rows = []
+        for i, t in enumerate(tracks):
+            g = t["g"]
+            ok, nts = status[t["label"]]
+            rows.append({"Brano": t["label"], "LUFS": g["lufs_i"], "Δ target": g["lufs_i"] - target_lufs,
+                         "True peak": g["tp_db"], "LRA": g["lra"], "Crest": g["crest_db"], "PLR": g["plr"],
+                         "Corr": g["corr"], "Width %": g["width_pct"], "Tilt": g["tilt"],
+                         "Stato": "—" if t["ref"] else ("🟢 OK" if ok else "🔴 " + "; ".join(nts))})
+        df = pd.DataFrame(rows)
+        mean_row = {"Brano": "MEDIA ALBUM", "Stato": "", **{c: np.nanmean([r[c] for r, t in zip(rows, tracks) if not t["ref"]])
+                                                              for c in df.columns[1:-1]}}
+        df = pd.concat([df, pd.DataFrame([mean_row])], ignore_index=True)
+        colmap = {"LUFS": "lufs_i", "LRA": "lra", "Crest": "crest_db", "PLR": "plr", "Corr": "corr", "Width %": "width_pct", "Tilt": "tilt"}
+
+        def hl(_):
+            sty = pd.DataFrame("", index=df.index, columns=df.columns)
+            for c, k in colmap.items():
+                for r in range(len(tracks)):
+                    if flag[T.LABEL[k]].iloc[r] and not tracks[r]["ref"]:
+                        sty.loc[r, c] = "background-color: #5a3a00; color: #ffd9a8"
+            sty.loc[len(df) - 1, :] = "font-weight: bold; color: #e8a020"
+            return sty
+
+        st.dataframe(df.style.apply(hl, axis=None).format(
+            {"LUFS": "{:.1f}", "Δ target": "{:+.1f}", "True peak": "{:.2f}", "LRA": "{:.1f}", "Crest": "{:.1f}",
+             "PLR": "{:.1f}", "Corr": "{:.2f}", "Width %": "{:.1f}", "Tilt": "{:+.2f}"}),
+            hide_index=True, width="stretch", height=min(60 + 35 * len(df), 800))
+        st.caption("Celle evidenziate: scostamento dalla media album oltre la soglia (impostabile in *Bande & Target*). "
+                   "Crest e PLR in dB; Tilt = pendenza dello spettro a terzi d'ottava tra 100 Hz e 10 kHz (0 = rumore rosa).")
+        with st.expander("Tutte le metriche"):
+            st.dataframe(T.summary_df(tracks).style.format(precision=2), hide_index=True, width="stretch")
+
+        if not vis:
+            st.info("Nessun brano selezionato nei grafici.")
+        else:
+            # --- metrica per brano
+            st.markdown("### 📈 Una metrica, tutti i brani")
+            mk = st.selectbox("Metrica", [k for k, *_ in T.GLOBAL_COLS], format_func=lambda k: T.LABEL[k], key="metric_sel")
+            fig = go.Figure(go.Bar(x=[t["label"] for t in vis], y=[t["g"][mk] for t in vis],
+                                   marker_color=[t["color"] if not t["ref"] else "#cccccc" for t in vis], name="Brani", showlegend=False))
+            mean_v = np.nanmean([t["g"][mk] for t in album])
+            fig.add_hline(y=mean_v, line=dict(color=AMBER, width=3, dash="dash"), annotation_text=f"media album {mean_v:.2f}",
+                          annotation_font_color=AMBER)
+            for t in tracks:
+                if t["ref"]:
+                    fig.add_hline(y=t["g"][mk], line=dict(color="#ffffff", width=2, dash="dot"),
+                                  annotation_text=t["label"], annotation_position="bottom right", annotation_font_color="#ffffff")
+            if mk == "lufs_i":
+                fig.add_hrect(y0=target_lufs - tol_lu, y1=target_lufs + tol_lu, fillcolor="#00ff9f", opacity=0.10, line_width=0)
+            if mk == "tp_db":
+                fig.add_hline(y=target_tp, line=dict(color="#ff007c", width=2), annotation_text=f"max {target_tp:g} dBTP",
+                              annotation_font_color="#ff007c")
+            st.plotly_chart(style_fig(fig, 380, T.LABEL[mk]), width="stretch")
+
+            # --- heatmap scostamenti
+            st.markdown("### 🌡️ Mappa degli scostamenti dalla media album")
+            rev = {v: k for k, v in T.LABEL.items()}
+            thr = np.array([thresholds["band_rel"] if c.startswith("Banda") else thresholds[rev[c]] for c in dev.columns])
+            dsub = dev.loc[[t["label"] for t in vis]]
+            z = (dsub.values / thr).clip(-2, 2)
+            txt = [[f"{v:+.2f}" if "Correlazione" in c else f"{v:+.1f}" for v, c in zip(row, dsub.columns)] for row in dsub.values]
+            hm = go.Figure(go.Heatmap(z=z, x=[c.replace(" [", "<br>[") for c in dsub.columns], y=dsub.index, text=txt, texttemplate="%{text}",
+                                      zmin=-2, zmax=2, showscale=False, xgap=2, ygap=2,
+                                      colorscale=[[0, "#2b6cb0"], [0.25, "#1b3552"], [0.5, "#111110"], [0.75, "#6b4500"], [1, AMBER]]))
+            hm.update_yaxes(autorange="reversed")
+            st.plotly_chart(style_fig(hm, 120 + 30 * len(dsub)), width="stretch")
+            st.caption("Valori = scostamento dalla media dell'album. Colore pieno = scostamento pari o superiore a 2 volte la soglia; "
+                       "blu = sotto la media, ambra = sopra.")
+
+            # --- spettro
+            st.markdown("### 🔊 Spettro a terzi d'ottava")
+            sv = st.radio("Vista", ["Spettro", "Scostamento dalla media album"], horizontal=True, key="spec_view")
+            mean_spec = T.album_mean(tracks, lambda t: T.spectrum_norm(t["g"]["third_db"], spec_norm))
+            fig = go.Figure()
+            for t in vis:
+                y = T.spectrum_norm(t["g"]["third_db"], spec_norm)
+                y = y - mean_spec if sv.startswith("Scost") else y
+                fig.add_trace(go.Scatter(x=T.THIRD_FC, y=y, name=t["label"], mode="lines", line=line_kw(t, 1.8)))
+            if sv.startswith("Scost"):
+                fig.add_hline(y=0, line=dict(color=AMBER, width=3, dash="dash"))
+            else:
+                add_mean_line(fig, T.THIRD_FC, mean_spec)
+            fig.update_xaxes(type="log", tickvals=[20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000],
+                             ticktext=["20", "50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"], range=[np.log10(18), np.log10(21000)])
+            st.plotly_chart(style_fig(fig, 480, "Scostamento [dB]" if sv.startswith("Scost") else "Livello 1/3 ottava [dB]", "Frequenza [Hz]"),
+                            width="stretch")
+
+            # --- sottobande
+            st.markdown("### 🎛️ Sottobande")
+            bm1, bm2 = st.columns([3, 2])
+            bmet = bm1.selectbox("Metrica di banda", list(T.BAND_METRICS), format_func=lambda k: T.BAND_METRICS[k], key="band_metric")
+            bdev = bm2.checkbox("Mostra come scostamento dalla media album", key="band_dev")
+            blabels = tracks[0]["b"]["labels"]
+            bmean = T.album_mean(tracks, lambda t: [T.band_value(t["g"], bd, bmet, weighting) for bd in t["b"]["bands"]])
+            fig = go.Figure()
+            for t in vis:
+                y = np.array([T.band_value(t["g"], bd, bmet, weighting) for bd in t["b"]["bands"]])
+                fig.add_trace(go.Scatter(x=blabels, y=y - bmean if bdev else y, name=t["label"], mode="lines+markers",
+                                         line=line_kw(t, 2), marker=dict(size=7)))
+            if bdev:
+                fig.add_hline(y=0, line=dict(color=AMBER, width=3, dash="dash"))
+            else:
+                add_mean_line(fig, blabels, bmean)
+            st.plotly_chart(style_fig(fig, 430, T.BAND_METRICS[bmet] + (" - scostamento" if bdev else "")), width="stretch")
+            with st.expander("Tabella sottobande (tutti i brani)"):
+                st.dataframe(T.bands_df(tracks, weighting).style.format(precision=2), hide_index=True, width="stretch")
+
+            # --- tempo
+            st.markdown("### ⏱️ Andamento nel tempo (finestra 3 s)")
+            sig_opts = ["Full band"] + blabels
+            tsel = st.selectbox("Segnale", sig_opts, key="time_sel")
+            fig = go.Figure()
+            for t in vis:
+                if tsel == "Full band":
+                    tl = t["g"]["timeline"]
+                    x, y = tl["t"], (tl["st_lufs"] if weighting == "k" else tl["st_rms"])
+                else:
+                    b = blabels.index(tsel)
+                    tl = t["b"]["timeline"]
+                    x, y = tl["t"], (tl["k"][b] if weighting == "k" else tl["rms"][b])
+                fig.add_trace(go.Scatter(x=x, y=y, name=t["label"], mode="lines", line=line_kw(t, 1.4)))
+            st.plotly_chart(style_fig(fig, 400, "Livello short-term [" + ("LUFS" if weighting == "k" else "dBFS RMS") + "]", "Tempo [s]"),
+                            width="stretch")
+
+# =============================================================================== TAB: DETTAGLIO & ASCOLTO
+with tab_det:
+    if not tracks:
+        st.info("Esegui prima l'analisi.")
+    else:
+        album = T.albums(tracks)
+        labels = [t["label"] for t in tracks]
+        tl_sel = st.selectbox("Brano", labels, key="det_track")
+        t = tracks[labels.index(tl_sel)]
+        g, b = t["g"], t["b"]
+        mean = lambda k: np.nanmean([x["g"][k] for x in album])
+        cols = st.columns(4)
+        for i, (k, nm, fmt) in enumerate([("lufs_i", "LUFS integrato", "{:.1f}"), ("tp_db", "True peak [dBTP]", "{:.2f}"),
+                                          ("lra", "LRA [LU]", "{:.1f}"), ("crest_db", "Crest [dB]", "{:.1f}"),
+                                          ("plr", "PLR [dB]", "{:.1f}"), ("corr", "Correlazione", "{:.2f}"),
+                                          ("width_pct", "Width [%]", "{:.1f}"), ("tilt", "Tilt [dB/ott]", "{:+.2f}")]):
+            cols[i % 4].metric(nm, fmt.format(g[k]), f"{g[k] - mean(k):+.2f} vs media album", delta_color="off")
+        ok, nts = T.target_status(g, target_lufs, tol_lu, target_tp)
+        if not t["ref"]:
+            (st.success if ok else st.warning)("Entro target." if ok else "Fuori target: " + "; ".join(nts))
+        if abs(g["dc_l"]) > 0.001 or abs(g["dc_r"]) > 0.001:
+            st.warning(f"DC offset rilevato (L {g['dc_l']:+.4f}, R {g['dc_r']:+.4f}).")
+
+        # spettro brano vs media vs reference
+        fig = go.Figure()
+        ms = T.album_mean(tracks, lambda x: T.spectrum_norm(x["g"]["third_db"], spec_norm))
+        fig.add_trace(go.Scatter(x=T.THIRD_FC, y=T.spectrum_norm(g["third_db"], spec_norm), name=t["label"], line=dict(color="#00d1ff", width=3)))
+        add_mean_line(fig, T.THIRD_FC, ms)
+        for r in [x for x in tracks if x["ref"] and x is not t]:
+            fig.add_trace(go.Scatter(x=T.THIRD_FC, y=T.spectrum_norm(r["g"]["third_db"], spec_norm), name=r["label"], line=line_kw(r)))
+        fig.update_xaxes(type="log", tickvals=[20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000],
+                         ticktext=["20", "50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"], range=[np.log10(18), np.log10(21000)])
+        st.plotly_chart(style_fig(fig, 360, "Livello 1/3 ottava [dB]", "Frequenza [Hz]"), width="stretch")
+
+        bd_rows = [{"Banda": bd["label"], "Livello rel. [dB]": T.band_value(g, bd, "rel", weighting),
+                    "Livello [dB]": T.band_value(g, bd, "level", weighting), "Quota energia [%]": bd["share_pct"],
+                    "Crest [dB]": bd["crest_db"], "Dinamica ST [dB]": T.band_value(g, bd, "dyn", weighting),
+                    "Width [%]": bd["width_pct"], "Corr": bd["corr"]} for bd in b["bands"]]
+        st.dataframe(pd.DataFrame(bd_rows).style.format(precision=2, subset=pd.IndexSlice[:, pd.DataFrame(bd_rows).columns[1:]]),
+                     hide_index=True, width="stretch")
+
+        # timeline brano: full + bande, con marker sezioni
+        sections = list(g["sections"]) + list(b["sections"])
+        fig = go.Figure()
+        tl = g["timeline"]
+        fig.add_trace(go.Scatter(x=tl["t"], y=tl["st_lufs"] if weighting == "k" else tl["st_rms"], name="Full band",
+                                 line=dict(color="#ffffff", width=2.5)))
+        for i, lab in enumerate(b["labels"]):
+            fig.add_trace(go.Scatter(x=b["timeline"]["t"], y=b["timeline"]["k"][i] if weighting == "k" else b["timeline"]["rms"][i],
+                                     name=lab, line=dict(color=PAL[(i * 5 + 1) % len(PAL)], width=1.6)))
+        for lab, ts, val in sections:
+            fig.add_vline(x=ts, line=dict(color="#ff007c", width=1, dash="dot"))
+        st.plotly_chart(style_fig(fig, 380, "Livello short-term [" + ("LUFS" if weighting == "k" else "dBFS RMS") + "]", "Tempo [s]"),
+                        width="stretch")
+        st.caption("Linee rosa verticali = passaggi rilevati automaticamente come potenzialmente critici (vedi player qui sotto).")
+
+        # ----- player
+        st.markdown("### 🎧 Player")
+        f = files_by_digest.get(t["digest"])
+        if f is None:
+            st.info("File audio non piu' caricato: ricaricalo per riascoltarlo.")
+        else:
+            dur = float(g["duration"])
+            mode = st.radio("Cosa ascoltare", ["Intero brano", "Passaggio rilevato", "Selezione manuale"], horizontal=True, key="play_mode")
+            start, end = 0, None
+            if mode == "Passaggio rilevato":
+                p1, p2, p3 = st.columns([4, 1, 1])
+                opt = p1.selectbox("Passaggio", range(len(sections)),
+                                   format_func=lambda i: f"{sections[i][0]} - {mmss(sections[i][1])} ({sections[i][2]})", key="sec_sel")
+                pre = p2.number_input("Anticipo [s]", 0, 30, 4, key="sec_pre")
+                length = p3.number_input("Durata [s]", 3, 120, 15, key="sec_len")
+                start = int(max(0, sections[opt][1] - pre))
+                end = int(min(dur, start + length))
+            elif mode == "Selezione manuale":
+                a, bb = st.slider("Intervallo [s]", 0.0, dur, (0.0, min(dur, 20.0)), 0.5, key="play_rng")
+                start, end = int(a), int(np.ceil(bb))
+            ext = f.name.rsplit(".", 1)[-1].lower()
+            if end is not None:
+                st.caption(f"Riproduzione da {mmss(start)} a {mmss(end)}")
+            st.audio(f.getvalue(), format=MIME.get(ext, "audio/wav"), start_time=start, end_time=end)
+            if ext in ("aif", "aiff"):
+                st.caption("Nota: alcuni browser non riproducono AIFF.")
+
+# =============================================================================== TAB: EXPORT
+with tab_exp:
+    if not tracks:
+        st.info("Esegui prima l'analisi.")
+    else:
+        st.subheader("CSV")
+        fmt_csv = st.radio("Formato", ["Excel italiano (; e virgola decimale)", "Standard (, e punto)"], horizontal=True)
+        kw = dict(index=False, sep=";", decimal=",") if fmt_csv.startswith("Excel") else dict(index=False)
+        enc = lambda d: d.to_csv(**kw).encode("utf-8-sig")
+        e1, e2, e3 = st.columns(3)
+        e1.download_button("⬇️ Riepilogo brani", enc(T.summary_df(tracks)), "album_riepilogo.csv", "text/csv")
+        e2.download_button("⬇️ Sottobande", enc(T.bands_df(tracks, weighting)), "album_sottobande.csv", "text/csv")
+        e3.download_button("⬇️ Spettro 1/3 ottava", enc(T.third_df(tracks, spec_norm)), "album_spettro_terzi.csv", "text/csv")
+
+        st.subheader("Report PDF")
+        logo_up = st.file_uploader("Logo Ventena Studios (opzionale: se non carichi nulla cerco assets/logo.png nel repository)",
+                                   type=["png", "jpg", "jpeg"], key="logo_up")
+        logo_path = None
+        if logo_up is not None:
+            tmp = Path(tempfile.gettempdir()) / f"ventena_logo_{logo_up.file_id if hasattr(logo_up, 'file_id') else 'x'}.png"
+            tmp.write_bytes(logo_up.getvalue())
+            logo_path = str(tmp)
+        else:
+            logo_path = find_logo([str(ROOT), str(Path.cwd())])
+        st.caption(f"Logo: {logo_path}" if logo_path else "Logo non trovato: uso l'intestazione testuale VENTENA STUDIOS.")
+        notes = st.text_area("Note da inserire nel report (opzionale)", key="pdf_notes")
+        per_track = st.checkbox("Includi una pagina di dettaglio per ogni brano", value=True)
+        if st.button("📄 Genera PDF", type="primary"):
+            with st.spinner("Generazione del report..."):
+                settings = dict(weighting=weighting, spec_norm=spec_norm, target_lufs=target_lufs, tol_lu=tol_lu,
+                                target_tp=target_tp, thresholds=thresholds)
+                S.pdf = build_pdf(tracks, settings, album_title or "Album", notes, logo_path, per_track)
+                S.pdf_sig = (sig, tuple(S.xo))
+        if S.pdf:
+            st.download_button("⬇️ Scarica il report PDF", S.pdf, f"{(album_title or 'album').strip().replace(' ', '_')}_mastering_report.pdf",
+                               "application/pdf", type="primary")
+
+st.caption("Album Mastering Analyzer | Developed by VentenaStudios for Producers & Engineers | 100% Private Analysis")
