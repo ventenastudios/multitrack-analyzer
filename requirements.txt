@@ -1,7 +1,11 @@
 streamlit
 librosa
 numpy
+scipy
+pandas
 pyloudnorm
 soundfile
 matplotlib
 plotly
+reportlab
+pillow
