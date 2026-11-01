@@ -103,22 +103,42 @@ def album_mean(tracks, getter):
         return np.nanmean(np.array(vals, dtype=float), axis=0)
 
 
-def deviation_df(tracks, weighting, thresh):
-    """Scostamento di ogni brano (e reference) dalla media album + flag outlier. Colonne = metriche."""
+def thr_for(columns, thresh):
+    """Soglia di segnalazione per ogni colonna di deviation_df."""
+    rev = {v: k for k, v in LABEL.items()}
+    return np.array([thresh["band_rel"] if c.startswith("Banda") else thresh[rev[c]] for c in columns])
+
+
+def deviation_df(tracks, weighting, thresh, baseline=None):
+    """Scostamenti per brano su metriche globali + livello relativo delle sottobande.
+
+    baseline=None  -> scostamento dalla MEDIA ALBUM (calcolata solo sui brani dell'album, reference escluse);
+                      le reference compaiono come righe e non entrano mai nella media.
+    baseline=track -> scostamento da quella reference (brano - reference). Il brano di riferimento non e' tra le
+                      righe; in fondo si aggiunge la riga 'MEDIA ALBUM' (media album - reference).
+    Restituisce (dev, flag): DataFrame con indice = nomi dei brani.
+    """
+    rows = [t for t in tracks if t is not baseline]
+    alb = albums(tracks)
+    nb = len(tracks[0]["b"]["bands"])
     cols = {}
     for k in DEV_METRICS:
-        cols[LABEL[k]] = ([t["g"][k] for t in tracks], thresh[k])
-    nb = len(tracks[0]["b"]["bands"])
+        cols[LABEL[k]] = (lambda t, k=k: t["g"][k], thresh[k])
     for b in range(nb):
         lab = f"Banda {tracks[0]['b']['bands'][b]['label']} rel. [dB]"
-        cols[lab] = ([band_value(t["g"], t["b"]["bands"][b], "rel", weighting) for t in tracks], thresh["band_rel"])
+        cols[lab] = (lambda t, b=b: band_value(t["g"], t["b"]["bands"][b], "rel", weighting), thresh["band_rel"])
     dev, flag = {}, {}
-    for lab, (vals, th) in cols.items():
-        v = np.array(vals, dtype=float)
-        ref_mean = np.nanmean(np.array([x for x, t in zip(v, tracks) if not t["ref"]], dtype=float))
-        dev[lab] = v - ref_mean
-        flag[lab] = np.abs(v - ref_mean) > th
-    names = [("REF - " if t["ref"] else "") + t["name"] for t in tracks]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for lab, (fn, th) in cols.items():
+            v = np.array([fn(t) for t in rows], dtype=float)
+            alb_mean = np.nanmean([fn(t) for t in alb])
+            if baseline is None:
+                d = v - alb_mean
+            else:
+                d = np.r_[v - fn(baseline), alb_mean - fn(baseline)]
+            dev[lab], flag[lab] = d, np.abs(d) > th
+    names = [("REF - " if t["ref"] else "") + t["name"] for t in rows] + (["MEDIA ALBUM"] if baseline is not None else [])
     return pd.DataFrame(dev, index=names), pd.DataFrame(flag, index=names)
 
 
